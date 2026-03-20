@@ -1,0 +1,8 @@
+name: terminal_hud
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - psutil>=5.9.0

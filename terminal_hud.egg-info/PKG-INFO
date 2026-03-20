@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: terminal-hud
+Version: 0.1.0
+Summary: Persistent terminal HUD showing CPU, memory, and network usage
+Requires-Python: >=3.10
+Requires-Dist: psutil>=5.9.0

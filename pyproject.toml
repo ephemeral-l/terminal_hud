@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminal-hud"
+version = "0.1.0"
+description = "Persistent terminal HUD showing CPU, memory, and network usage"
+requires-python = ">=3.10"
+dependencies = ["psutil>=5.9.0"]
+
+[project.scripts]
+terminal-hud = "terminal_hud.cli:main"

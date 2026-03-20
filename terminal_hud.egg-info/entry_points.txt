@@ -1,0 +1,2 @@
+[console_scripts]
+terminal-hud = terminal_hud.cli:main
