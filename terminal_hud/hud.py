@@ -4,12 +4,14 @@ import atexit
 import fcntl
 import os
 import pty
+import select
 import signal
 import struct
 import sys
 import termios
 import threading
 import time
+import tty
 
 from terminal_hud.colors import (
     BG_HUD, BOLD, DIM, FG_CYAN, FG_GRAY, FG_WHITE, RESET, V_LINE,
@@ -18,6 +20,7 @@ from terminal_hud.colors import (
 from terminal_hud.stats import StatsCollector
 
 HUD_HEIGHT = 2  # lines reserved at bottom
+RESIZE_DEBOUNCE_S = 0.15  # wait 150ms for resize signals to settle
 
 
 def _get_terminal_size() -> tuple[int, int]:
@@ -41,33 +44,32 @@ class HUD:
         self.show_network = show_network
         self.collector = StatsCollector(interface=interface)
         self._running = False
-        self._lock = threading.Lock()
+        # Single lock serializes ALL writes to stdout (HUD render + child relay)
+        self._io_lock = threading.Lock()
         self._lines = 0
         self._cols = 0
         self._thread: threading.Thread | None = None
         self._child_pid: int = 0
-        self._child_fd: int = -1  # pty fd for the child shell
+        self._child_fd: int = -1
+
+        # Resize state — signal handler sets flag, loops process it
+        self._resize_pending = False
+        self._resize_time: float = 0.0
 
     def start(self):
         """Start the HUD: set up scroll region, spawn shell, begin updates."""
         self._running = True
         self._lines, self._cols = _get_terminal_size()
 
-        # Register cleanup
         atexit.register(self._cleanup)
         signal.signal(signal.SIGWINCH, self._on_resize)
 
-        # Set up scroll region
         self._setup_scroll_region()
 
-        # Start update thread
         self._thread = threading.Thread(target=self._update_loop, daemon=True)
         self._thread.start()
 
-        # Spawn user's shell in the scroll region
         self._spawn_shell()
-
-        # Shell exited — stop
         self.stop()
 
     def stop(self):
@@ -79,103 +81,132 @@ class HUD:
             self._thread.join(timeout=2)
         self._cleanup()
 
+    # --- Terminal setup / teardown ---
+
     def _setup_scroll_region(self):
         """Reserve bottom lines for HUD using scroll region."""
-        scroll_end = self._lines - HUD_HEIGHT
-        if scroll_end < 1:
-            scroll_end = 1
-        # Set scroll region to top portion
-        sys.stdout.write(f"\033[1;{scroll_end}r")
-        # Move cursor to top-left of scroll region
-        sys.stdout.write(f"\033[{scroll_end};1H")
-        sys.stdout.flush()
-        # Draw initial HUD
+        scroll_end = max(1, self._lines - HUD_HEIGHT)
+        with self._io_lock:
+            sys.stdout.write(f"\033[1;{scroll_end}r")
+            sys.stdout.write(f"\033[{scroll_end};1H")
+            sys.stdout.flush()
         self._render()
 
     def _cleanup(self):
         """Restore terminal state."""
         try:
-            # Reset scroll region to full terminal
-            sys.stdout.write("\033[r")
-            # Clear HUD area
-            lines, cols = _get_terminal_size()
-            for i in range(HUD_HEIGHT):
-                row = lines - HUD_HEIGHT + 1 + i
-                sys.stdout.write(f"\033[{row};1H\033[2K")
-            # Move cursor to a sane position
-            sys.stdout.write(f"\033[{lines - HUD_HEIGHT};1H")
-            # Show cursor
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
+            with self._io_lock:
+                sys.stdout.write("\033[r")
+                lines, cols = _get_terminal_size()
+                for i in range(HUD_HEIGHT):
+                    row = lines - HUD_HEIGHT + 1 + i
+                    sys.stdout.write(f"\033[{row};1H\033[2K")
+                sys.stdout.write(f"\033[{lines - HUD_HEIGHT};1H")
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
         except Exception:
             pass
 
+    # --- Rendering ---
+
+    def _build_hud_str(self, lines: int, cols: int) -> str:
+        """Build the HUD output string. Pure function, no I/O."""
+        stats = self.collector.collect_all()
+
+        if lines < 4 or cols < 40:
+            return ""
+
+        hud_row = lines - HUD_HEIGHT + 1
+
+        parts = [
+            "\033[s",       # save cursor
+            "\033[?25l",    # hide cursor
+            f"\033[{hud_row};1H\033[2K",  # move to HUD line 1, clear
+        ]
+
+        # Line 1: stats
+        cpu_section = f" CPU {bar(stats.cpu_percent, 10)}"
+        mem = stats.memory
+        mem_section = (
+            f" MEM {bar(mem.percent, 10)}"
+            f" {FG_GRAY}{mem.used_gb:.1f}/{mem.total_gb:.1f}G{RESET}"
+        )
+
+        line1 = f"{BG_HUD}{FG_WHITE}{BOLD} {RESET}{BG_HUD}"
+        line1 += cpu_section
+        line1 += f" {FG_GRAY}{V_LINE}{RESET}{BG_HUD}"
+        line1 += mem_section
+
+        if self.show_network:
+            net = stats.network
+            line1 += (
+                f" {FG_GRAY}{V_LINE}{RESET}{BG_HUD}"
+                f" NET"
+                f" {FG_CYAN}\u2193{RESET}{BG_HUD} {format_bytes_speed(net.down_bps)}"
+                f" {FG_CYAN}\u2191{RESET}{BG_HUD} {format_bytes_speed(net.up_bps)}"
+            )
+
+        line1 += "\033[K" + RESET
+        parts.append(line1)
+
+        # Line 2: info
+        parts.append(f"\033[{hud_row + 1};1H\033[2K")
+        parts.append(
+            f"{BG_HUD}{DIM}{FG_GRAY}"
+            f"  terminal-hud"
+            f" {V_LINE} interval: {self.interval}s"
+            f" {V_LINE} Ctrl+C to exit"
+            f"\033[K{RESET}"
+        )
+
+        # Restore cursor + show cursor
+        parts.append("\033[u\033[?25h")
+
+        return "".join(parts)
+
     def _render(self):
-        """Draw the HUD on the reserved bottom lines."""
-        with self._lock:
-            try:
-                stats = self.collector.collect_all()
-                lines, cols = self._lines, self._cols
-
-                if lines < 4 or cols < 40:
-                    return  # Terminal too small
-
-                hud_row = lines - HUD_HEIGHT + 1
-
-                # Save cursor position
-                out = "\033[s"
-                # Hide cursor during draw
-                out += "\033[?25l"
-
-                # --- Line 1: Stats ---
-                out += f"\033[{hud_row};1H\033[2K"
-
-                cpu_section = f" CPU {bar(stats.cpu_percent, 10)}"
-                mem = stats.memory
-                mem_section = (
-                    f" MEM {bar(mem.percent, 10)}"
-                    f" {FG_GRAY}{mem.used_gb:.1f}/{mem.total_gb:.1f}G{RESET}"
-                )
-
-                line1 = f"{BG_HUD}{FG_WHITE}{BOLD} {RESET}{BG_HUD}"
-                line1 += cpu_section
-                line1 += f" {FG_GRAY}{V_LINE}{RESET}{BG_HUD}"
-                line1 += mem_section
-
-                if self.show_network:
-                    net = stats.network
-                    net_section = (
-                        f" NET"
-                        f" {FG_CYAN}↓{RESET}{BG_HUD} {format_bytes_speed(net.down_bps)}"
-                        f" {FG_CYAN}↑{RESET}{BG_HUD} {format_bytes_speed(net.up_bps)}"
-                    )
-                    line1 += f" {FG_GRAY}{V_LINE}{RESET}{BG_HUD}"
-                    line1 += net_section
-
-                # Erase to end of line (inherits BG color) instead of padding
-                line1 += "\033[K"
-                line1 += RESET
-                out += line1
-
-                # --- Line 2: Info bar ---
-                out += f"\033[{hud_row + 1};1H\033[2K"
-                info = (
-                    f"{BG_HUD}{DIM}{FG_GRAY}"
-                    f"  terminal-hud"
-                    f" {V_LINE} interval: {self.interval}s"
-                    f" {V_LINE} Ctrl+C to exit"
-                    f"\033[K"
-                )
-                info += RESET
-                out += info
-
-                # Restore cursor position & show cursor
-                out += "\033[u\033[?25h"
-
+        """Build HUD string then write it atomically under the I/O lock."""
+        try:
+            out = self._build_hud_str(self._lines, self._cols)
+            if not out:
+                return
+            with self._io_lock:
                 sys.stdout.write(out)
                 sys.stdout.flush()
-            except Exception:
-                pass  # Don't crash the update loop on render errors
+        except Exception:
+            pass
+
+    # --- Resize handling ---
+
+    def _on_resize(self, signum, frame):
+        """SIGWINCH handler — minimal work. Just record the event."""
+        self._resize_pending = True
+        self._resize_time = time.monotonic()
+
+    def _process_resize(self):
+        """Apply a pending resize after debounce period has elapsed.
+
+        Called from the relay loop (main thread) so we can coordinate
+        with child I/O and avoid interleaving.
+        """
+        self._resize_pending = False
+        try:
+            self._lines, self._cols = _get_terminal_size()
+        except OSError:
+            return
+
+        scroll_end = max(1, self._lines - HUD_HEIGHT)
+
+        # Update scroll region atomically
+        with self._io_lock:
+            sys.stdout.write(f"\033[1;{scroll_end}r")
+            sys.stdout.flush()
+
+        # Tell child shell the new usable size, then signal it
+        self._set_child_winsize()
+
+        # Re-render HUD (acquires _io_lock internally)
+        self._render()
 
     def _set_child_winsize(self):
         """Tell the child pty its usable size (full terminal minus HUD)."""
@@ -188,78 +219,77 @@ class HUD:
             fcntl.ioctl(self._child_fd, termios.TIOCSWINSZ, winsize)
         except OSError:
             pass
-        # Notify child process so it re-queries its terminal size
         if self._child_pid > 0:
             try:
                 os.kill(self._child_pid, signal.SIGWINCH)
             except OSError:
                 pass
 
-    def _on_resize(self, signum, frame):
-        """Handle terminal resize."""
-        try:
-            self._lines, self._cols = _get_terminal_size()
-            scroll_end = self._lines - HUD_HEIGHT
-            if scroll_end < 1:
-                scroll_end = 1
-            sys.stdout.write(f"\033[1;{scroll_end}r")
-            sys.stdout.flush()
-            # Propagate adjusted size to child (e.g. Claude Code)
-            self._set_child_winsize()
-            self._render()
-        except Exception:
-            pass
+    # --- Update loop (background thread) ---
 
     def _update_loop(self):
         """Background thread: periodically refresh the HUD."""
         while self._running:
-            self._render()
-            time.sleep(self.interval)
+            # Skip rendering while resize is settling — avoid fighting
+            # with child app's re-render burst
+            if not self._resize_pending:
+                self._render()
+                time.sleep(self.interval)
+            else:
+                # Poll quickly so we resume rendering promptly after settle
+                time.sleep(0.05)
+
+    # --- Shell spawning + I/O relay ---
 
     def _spawn_shell(self):
         """Spawn the user's shell as a child process."""
         shell = os.environ.get("SHELL", "/bin/bash")
         env = os.environ.copy()
 
-        # Use pty.spawn for proper terminal handling
-        # This gives the child shell full PTY access within the scroll region
         try:
             pid, fd = pty.fork()
         except OSError:
-            # Fallback: just wait for Ctrl+C
             self._wait_forever()
             return
 
         if pid == 0:
-            # Child process — exec the shell
             os.execvpe(shell, [shell], env)
         else:
-            # Parent — store refs and set child pty to adjusted size
             self._child_pid = pid
             self._child_fd = fd
             self._set_child_winsize()
             self._relay_io(pid, fd)
 
     def _relay_io(self, pid: int, fd: int):
-        """Relay I/O between the terminal and the child shell."""
-        import select
-        import tty
+        """Relay I/O between the terminal and the child shell.
 
-        old_settings = termios.tcgetattr(sys.stdin.fileno())
+        This is the main thread's hot loop. It also handles debounced
+        resize processing between I/O cycles.
+        """
+        stdin_fd = sys.stdin.fileno()
+        stdout_fd = sys.stdout.fileno()
+
+        old_settings = termios.tcgetattr(stdin_fd)
         try:
-            tty.setraw(sys.stdin.fileno())
+            tty.setraw(stdin_fd)
 
             while self._running:
+                # Process resize if debounce period has elapsed
+                if self._resize_pending:
+                    elapsed = time.monotonic() - self._resize_time
+                    if elapsed >= RESIZE_DEBOUNCE_S:
+                        self._process_resize()
+
                 try:
                     rlist, _, _ = select.select(
-                        [sys.stdin.fileno(), fd], [], [], 0.1
+                        [stdin_fd, fd], [], [], 0.1
                     )
                 except (ValueError, OSError):
                     break
 
-                if sys.stdin.fileno() in rlist:
+                if stdin_fd in rlist:
                     try:
-                        data = os.read(sys.stdin.fileno(), 1024)
+                        data = os.read(stdin_fd, 1024)
                         if not data:
                             break
                         os.write(fd, data)
@@ -271,17 +301,19 @@ class HUD:
                         data = os.read(fd, 4096)
                         if not data:
                             break
-                        os.write(sys.stdout.fileno(), data)
+                        # Write child output under I/O lock so it never
+                        # interleaves with HUD render escape sequences
+                        with self._io_lock:
+                            os.write(stdout_fd, data)
                     except OSError:
                         break
 
-            # Wait for child to finish
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:
                 pass
         finally:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
             try:
                 os.close(fd)
             except OSError:
