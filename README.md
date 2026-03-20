@@ -83,6 +83,33 @@ terminal-hud --no-network
 terminal-hud -i 5
 ```
 
+## Using with tmux (recommended)
+
+**Start tmux first, then run terminal-hud inside it.** This is the recommended setup because tmux uses alternate screen mode — if you run terminal-hud first and then start tmux inside it, the HUD would be hidden the entire time tmux is active.
+
+```bash
+tmux
+# inside tmux:
+conda activate terminal_hud
+terminal-hud
+```
+
+What you see:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ $ your shell, docker, claude, etc.                                           │
+│                                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ CPU [████░░░░░░]  35% │ MEM [██████░░░░]  62% 5.0/8.0G │ NET ↓ 1.2 MB/s ↑… │
+│  terminal-hud │ interval: 1.0s │ Ctrl+C to exit                             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ [tmux status bar]                                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Full-screen apps (vim, less, htop) launched inside the HUD shell will temporarily hide the HUD — it automatically reappears when you exit them.
+
 ## Using with Claude Code
 
 Start `terminal-hud`, then launch `claude` inside it:
@@ -95,6 +122,19 @@ claude
 
 Claude Code renders its UI (input box, output, status bar) in the space above the HUD. The HUD stays pinned at the very bottom. Terminal resizes (including moving between monitors with different resolutions) are handled correctly — resize signals are debounced and propagated to Claude Code without display corruption.
 
+## Using with Docker
+
+The HUD persists when you `docker exec -it` into a container:
+
+```bash
+terminal-hud
+# Inside the HUD shell:
+docker exec -it my_container bash
+# Container shell works normally, HUD stays at the bottom
+```
+
+Resize events (including monitor switches) propagate correctly through the PTY chain to the container.
+
 ## How it works
 
 1. **Scroll region** — reserves the bottom 2 terminal lines using ANSI escape sequence `\033[1;Nr` so the shell above scrolls independently
@@ -102,6 +142,7 @@ Claude Code renders its UI (input box, output, status bar) in the space above th
 3. **I/O relay** — a `select()` loop relays keystrokes and output between you and the child shell
 4. **Background thread** — collects CPU/MEM/NET stats via `psutil` every interval and redraws the HUD
 5. **Resize handling** — SIGWINCH is debounced (150ms), then the scroll region + child PTY size are updated atomically under an I/O lock to prevent display corruption
+6. **Alt screen detection** — when a full-screen app (tmux, vim, less) enters alternate screen mode, the HUD pauses rendering and re-applies the scroll region when the app exits
 
 ## Project structure
 

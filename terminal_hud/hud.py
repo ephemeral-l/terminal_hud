@@ -56,6 +56,12 @@ class HUD:
         self._resize_pending = False
         self._resize_time: float = 0.0
 
+        # Alternate screen tracking — full-screen apps (tmux, vim, less)
+        # enter alternate screen mode which resets scroll regions.
+        # We pause HUD rendering and re-apply scroll region on exit.
+        self._alt_screen = False
+        self._need_scroll_reset = False
+
     def start(self):
         """Start the HUD: set up scroll region, spawn shell, begin updates."""
         self._running = True
@@ -195,15 +201,20 @@ class HUD:
         except OSError:
             return
 
+        # Tell child shell the new usable size
+        self._set_child_winsize()
+
+        if self._alt_screen:
+            # Full-screen app owns the display — don't touch scroll region.
+            # Scroll region will be re-applied when alt screen exits.
+            return
+
         scroll_end = max(1, self._lines - HUD_HEIGHT)
 
         # Update scroll region atomically
         with self._io_lock:
             sys.stdout.write(f"\033[1;{scroll_end}r")
             sys.stdout.flush()
-
-        # Tell child shell the new usable size, then signal it
-        self._set_child_winsize()
 
         # Re-render HUD (acquires _io_lock internally)
         self._render()
@@ -225,19 +236,57 @@ class HUD:
             except OSError:
                 pass
 
+    # --- Alternate screen detection ---
+
+    # Sequences that full-screen apps (tmux, vim, less) use.
+    # Enter: save main screen, switch to alt buffer.
+    # Exit:  switch back to main screen, restore.
+    _ALT_ENTER = (b"\033[?1049h", b"\033[?47h", b"\033[?1047h")
+    _ALT_EXIT = (b"\033[?1049l", b"\033[?47l", b"\033[?1047l")
+
+    def _scan_alt_screen(self, data: bytes):
+        """Check child output for alternate screen enter/exit sequences."""
+        for seq in self._ALT_ENTER:
+            if seq in data:
+                self._alt_screen = True
+                return
+        for seq in self._ALT_EXIT:
+            if seq in data:
+                self._alt_screen = False
+                self._need_scroll_reset = True
+                return
+
+    def _restore_scroll_region(self):
+        """Re-establish scroll region after a full-screen app exits."""
+        self._need_scroll_reset = False
+        try:
+            self._lines, self._cols = _get_terminal_size()
+        except OSError:
+            return
+        scroll_end = max(1, self._lines - HUD_HEIGHT)
+        with self._io_lock:
+            sys.stdout.write(f"\033[1;{scroll_end}r")
+            # Move cursor into the scroll region (not in HUD area)
+            sys.stdout.write(f"\033[{scroll_end};1H")
+            sys.stdout.flush()
+
     # --- Update loop (background thread) ---
 
     def _update_loop(self):
         """Background thread: periodically refresh the HUD."""
         while self._running:
-            # Skip rendering while resize is settling — avoid fighting
-            # with child app's re-render burst
-            if not self._resize_pending:
+            if self._need_scroll_reset:
+                self._restore_scroll_region()
+
+            if self._alt_screen:
+                # Full-screen app active — don't render HUD
+                time.sleep(0.1)
+            elif self._resize_pending:
+                # Resize settling — poll quickly
+                time.sleep(0.05)
+            else:
                 self._render()
                 time.sleep(self.interval)
-            else:
-                # Poll quickly so we resume rendering promptly after settle
-                time.sleep(0.05)
 
     # --- Shell spawning + I/O relay ---
 
@@ -301,6 +350,8 @@ class HUD:
                         data = os.read(fd, 4096)
                         if not data:
                             break
+                        # Detect alternate screen mode (tmux, vim, less)
+                        self._scan_alt_screen(data)
                         # Write child output under I/O lock so it never
                         # interleaves with HUD render escape sequences
                         with self._io_lock:
